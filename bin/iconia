@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+# iconia — usa um tablet Android antigo (Acer Iconia B1) como monitor auxiliar.
+#
+# Cria um monitor virtual no PC, exporta só essa área via VNC e entrega ao
+# tablet por USB (adb) ou Wi-Fi. Veja README.md.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+CONFIG_FILE="${ICONIA_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/iconia-b1/config}"
+STATE_DIR="${XDG_RUNTIME_DIR:-/tmp}/iconia-b1-$(id -u)"
+STATE_FILE="$STATE_DIR/state"
+PASS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/iconia-b1/passwd"
+
+# ---- padrões (sobrescreva em $CONFIG_FILE ou por flags) ----
+RES="1024x600"          # B1-A71/B1-710/B1-711. B1-730HD: 1280x800
+REFRESH="60"
+TABLET_MM="154x90"      # tamanho físico aproximado (7")
+POS="right"             # right|left|above|below (método fb: só right|below)
+METHOD="auto"           # X11: auto|output|fb
+MODE="usb"              # usb|wifi
+VNC_PORT="5900"         # porta do VNC no PC e no tablet
+DEV_PORT="5901"         # porta do relay no tablet (lado do PC)
+FWD_PORT="6001"         # porta local do adb forward
+LAUNCH_CLIENT="0"       # 1 = abrir vnc:// no tablet automaticamente
+VNC_PASSWORD=""         # usado pelo krfb (KDE Wayland)
+RELAY_REMOTE="/data/local/tmp/iconia-relay"
+INSECURE="0"
+
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && . "$CONFIG_FILE"
+
+log()  { printf '\033[1;34m[iconia]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33m[iconia]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[iconia]\033[0m %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "comando '$1' não encontrado. ${2:-}"; }
+adbs() { adb shell "$@" | tr -d '\r'; }
+
+usage() {
+	cat <<EOF
+uso: iconia <comando> [opções]
+
+comandos:
+  start     cria o monitor virtual e serve para o tablet (Ctrl+C encerra)
+  stop      desfaz restos de uma sessão interrompida
+  doctor    verifica dependências, saídas de vídeo e o tablet
+  passwd    define a senha VNC (obrigatória no modo wifi)
+
+opções de start:
+  --usb | --wifi         transporte (padrão: $MODE)
+  --res WxH              resolução (padrão: $RES)
+  --pos right|left|above|below
+  --method auto|output|fb  (somente X11)
+  --port N               porta VNC (padrão: $VNC_PORT)
+  --launch               abre o cliente VNC no tablet via adb
+  --insecure             permite wifi sem senha (não recomendado)
+
+configuração persistente: $CONFIG_FILE
+EOF
+}
+
+# ---------------------------------------------------------------- estado
+state_set() { mkdir -p "$STATE_DIR"; printf '%s=%q\n' "$1" "$2" >>"$STATE_FILE"; }
+# shellcheck source=/dev/null
+state_load() { [[ -f "$STATE_FILE" ]] && . "$STATE_FILE"; return 0; }
+
+parse_res() {
+	[[ "$RES" =~ ^([0-9]+)x([0-9]+)$ ]] || die "resolução inválida: $RES"
+	W="${BASH_REMATCH[1]}"; H="${BASH_REMATCH[2]}"
+	[[ "$TABLET_MM" =~ ^([0-9]+)x([0-9]+)$ ]] || die "TABLET_MM inválido: $TABLET_MM"
+	MMW="${BASH_REMATCH[1]}"; MMH="${BASH_REMATCH[2]}"
+}
+
+session_type() {
+	if [[ -n "${SWAYSOCK:-}" ]]; then echo sway
+	elif [[ "${XDG_SESSION_TYPE:-}" == wayland || -n "${WAYLAND_DISPLAY:-}" ]]; then
+		case "${XDG_CURRENT_DESKTOP:-}" in
+			*KDE*) echo kde ;;
+			*GNOME*) echo gnome ;;
+			*) echo wayland ;;
+		esac
+	elif [[ -n "${DISPLAY:-}" ]]; then echo x11
+	else echo none
+	fi
+}
+
+# ---------------------------------------------------------------- X11
+x11_primary() {
+	local p
+	p="$(xrandr | awk '/ connected primary/{print $1; exit}')"
+	[[ -n "$p" ]] || p="$(xrandr | awk '/ connected/{print $1; exit}')"
+	echo "$p"
+}
+
+x11_geom_of() { xrandr | grep "^$1 " | grep -oE '[0-9]+x[0-9]+\+[0-9]+\+[0-9]+' | head -n1; }
+
+x11_free_output() {
+	local o
+	for o in VIRTUAL1 VIRTUAL-1; do
+		xrandr | grep -q "^$o " && { echo "$o"; return; }
+	done
+	# Saída desconectada e desligada (sem geometria) serve de "tela fantasma".
+	xrandr | awk '/ disconnected/ && $3 !~ /^[0-9]+x[0-9]+\+/ {print $1; exit}'
+}
+
+modeline() {
+	local ml=""
+	if command -v cvt >/dev/null; then
+		ml="$(cvt "$W" "$H" "$REFRESH" | sed -n 's/^Modeline "[^"]*" *//p')"
+	elif command -v gtf >/dev/null; then
+		ml="$(gtf "$W" "$H" "$REFRESH" | sed -n 's/^ *Modeline "[^"]*" *//p')"
+	fi
+	[[ -n "$ml" ]] || return 1
+	echo "$ml"
+}
+
+x11_create_output() {
+	local out primary mode ml
+	out="$(x11_free_output)"
+	[[ -n "$out" ]] || { warn "nenhuma saída de vídeo livre"; return 1; }
+	primary="$(x11_primary)"
+	mode="iconia-${W}x${H}"
+	ml="$(modeline)" || { warn "cvt/gtf não encontrados"; return 1; }
+	log "método output: usando saída $out (${POS} de $primary)"
+	# shellcheck disable=SC2086
+	xrandr --newmode "$mode" $ml 2>/dev/null || true
+	xrandr --addmode "$out" "$mode" || return 1
+	state_set X_OUTPUT "$out"; state_set X_MODE "$mode"
+	xrandr --output "$out" --mode "$mode" "--${POS}-of" "$primary" || return 1
+	sleep 0.5
+	GEOM="$(x11_geom_of "$out")"
+	[[ -n "$GEOM" ]] || return 1
+}
+
+x11_create_fb() {
+	local cw ch nw nh x y
+	read -r cw ch < <(xrandr | sed -n 's/.*current \([0-9]*\) x \([0-9]*\).*/\1 \2/p' | head -n1)
+	case "$POS" in
+		right) x=$cw; y=0; nw=$((cw + W)); nh=$(( ch > H ? ch : H )) ;;
+		below) x=0; y=$ch; nw=$(( cw > W ? cw : W )); nh=$((ch + H)) ;;
+		*) die "método fb só suporta --pos right ou below" ;;
+	esac
+	local mw mh
+	read -r mw mh < <(xrandr | sed -n 's/.*maximum \([0-9]*\) x \([0-9]*\).*/\1 \2/p' | head -n1)
+	(( nw <= mw && nh <= mh )) || die "framebuffer ${nw}x${nh} excede o máximo do driver (${mw}x${mh})"
+	log "método fb: framebuffer ${cw}x${ch} -> ${nw}x${nh}"
+	state_set X_OLDFB "${cw}x${ch}"
+	xrandr --fb "${nw}x${nh}"
+	xrandr --setmonitor iconia "${W}/${MMW}x${H}/${MMH}+${x}+${y}" none
+	state_set X_SETMONITOR 1
+	GEOM="${W}x${H}+${x}+${y}"
+}
+
+x11_remove() {
+	if [[ -n "${X_OUTPUT:-}" ]]; then
+		xrandr --output "$X_OUTPUT" --off 2>/dev/null || true
+		xrandr --delmode "$X_OUTPUT" "$X_MODE" 2>/dev/null || true
+		xrandr --rmmode "$X_MODE" 2>/dev/null || true
+	fi
+	if [[ -n "${X_SETMONITOR:-}" ]]; then
+		xrandr --delmonitor iconia 2>/dev/null || true
+	fi
+	if [[ -n "${X_OLDFB:-}" ]]; then
+		xrandr --fb "$X_OLDFB" 2>/dev/null || true
+	fi
+}
+
+x11_start() {
+	need xrandr "Instale o pacote x11-xserver-utils."
+	need x11vnc "Instale o pacote x11vnc."
+	case "$METHOD" in
+		output) x11_create_output || die "falha ao criar saída virtual; tente --method fb" ;;
+		fb) x11_create_fb ;;
+		auto)
+			if ! x11_create_output; then
+				warn "saída virtual indisponível; usando framebuffer estendido"
+				state_load; x11_remove; : >"$STATE_FILE"
+				unset X_OUTPUT X_MODE
+				state_set SESSION x11
+				x11_create_fb
+			fi ;;
+		*) die "método inválido: $METHOD" ;;
+	esac
+	log "área do tablet: $GEOM"
+
+	local args=(-display "$DISPLAY" -clip "$GEOM" -rfbport "$VNC_PORT"
+		-forever -shared -noxdamage -nowf -wait 10 -defer 10 -quiet)
+	if [[ "$MODE" == usb ]]; then
+		args+=(-localhost -nopw)
+	elif [[ -f "$PASS_FILE" ]]; then
+		args+=(-rfbauth "$PASS_FILE")
+	elif [[ "$INSECURE" == 1 ]]; then
+		args+=(-nopw)
+	else
+		die "modo wifi exige senha: rode 'iconia passwd' (ou use --insecure)"
+	fi
+	x11vnc "${args[@]}" &
+	state_set PID_VNC $!
+}
+
+# ---------------------------------------------------------------- Wayland
+sway_start() {
+	need swaymsg; need jq; need wayvnc "Instale o pacote wayvnc."
+	local before new ref x y
+	before="$(swaymsg -t get_outputs -r | jq -r '.[].name')"
+	swaymsg create_output >/dev/null
+	new="$(swaymsg -t get_outputs -r | jq -r '.[].name' | grep -vxF "$before" | head -n1)"
+	[[ -n "$new" ]] || die "sway não criou a saída headless"
+	state_set SWAY_OUTPUT "$new"
+	ref="$(swaymsg -t get_outputs -r | jq -c '[.[] | select(.focused)][0].rect')"
+	case "$POS" in
+		right) x=$(jq '.x + .width' <<<"$ref"); y=$(jq '.y' <<<"$ref") ;;
+		below) x=$(jq '.x' <<<"$ref"); y=$(jq '.y + .height' <<<"$ref") ;;
+		left)  x=$(jq ".x - $W" <<<"$ref"); y=$(jq '.y' <<<"$ref") ;;
+		above) x=$(jq '.x' <<<"$ref"); y=$(jq ".y - $H" <<<"$ref") ;;
+	esac
+	swaymsg output "$new" resolution "${W}x${H}" position "$x" "$y" >/dev/null
+	log "sway: saída $new ${W}x${H}+${x}+${y}"
+	local addr=127.0.0.1
+	if [[ "$MODE" == wifi ]]; then
+		[[ "$INSECURE" == 1 ]] || die "wayvnc com senha exige configuração própria (veja README); ou use --insecure"
+		addr=0.0.0.0
+	fi
+	wayvnc -o "$new" "$addr" "$VNC_PORT" &
+	state_set PID_VNC $!
+}
+
+sway_remove() {
+	[[ -n "${SWAY_OUTPUT:-}" ]] && swaymsg output "$SWAY_OUTPUT" unplug >/dev/null 2>&1 || true
+}
+
+kde_start() {
+	need krfb-virtualmonitor "Instale o krfb (KDE Gear 23.04 ou mais novo)."
+	if [[ -z "$VNC_PASSWORD" ]]; then
+		VNC_PASSWORD="$(tr -dc 'a-z0-9' </dev/urandom | head -c 8)"
+		log "senha VNC desta sessão: $VNC_PASSWORD"
+	fi
+	krfb-virtualmonitor --resolution "${W}x${H}" --name iconia \
+		--password "$VNC_PASSWORD" --port "$VNC_PORT" &
+	state_set PID_VNC $!
+	log "posicione o monitor 'iconia' em Configurações do Sistema > Telas"
+}
+
+# ---------------------------------------------------------------- USB / adb
+relay_bin() {
+	local f="$ROOT/build/iconia-relay-$1"
+	if [[ ! -x "$f" ]]; then
+		need go "Baixe os binários da release ou instale Go e rode 'make'."
+		make -C "$ROOT" relay >&2
+	fi
+	echo "$f"
+}
+
+adb_start() {
+	need adb "Instale o pacote adb (android-tools)."
+	log "aguardando tablet no USB (ative a Depuração USB)…"
+	timeout 60 adb wait-for-device || die "tablet não encontrado pelo adb"
+	local sdk model abi arch
+	sdk="$(adbs getprop ro.build.version.sdk)"
+	model="$(adbs getprop ro.product.model)"
+	abi="$(adbs getprop ro.product.cpu.abi)"
+	log "tablet: $model (API $sdk, $abi)"
+	adbs svc power stayon usb >/dev/null || true
+	state_set ADB_STAYON 1
+
+	if (( sdk >= 21 )); then
+		adb reverse "tcp:$VNC_PORT" "tcp:$VNC_PORT" >/dev/null
+		state_set ADB_REVERSE "$VNC_PORT"
+		log "adb reverse ativo"
+	else
+		local dev host
+		case "$abi" in
+			arm64*) arch=arm64 ;;
+			armeabi*) arch=arm ;;
+			x86_64) arch=amd64 ;;
+			x86) arch=386 ;;
+			*) die "ABI não suportada: $abi" ;;
+		esac
+		dev="$(relay_bin "android-$arch")"; host="$(relay_bin host)"
+		adb push "$dev" "$RELAY_REMOTE" >/dev/null 2>&1 || die "falha no adb push"
+		adbs chmod 755 "$RELAY_REMOTE"
+		adb_kill_relay
+		adb shell "$RELAY_REMOTE device -client 127.0.0.1:$VNC_PORT -host 127.0.0.1:$DEV_PORT" </dev/null &
+		state_set PID_ADBSHELL $!
+		state_set ADB_RELAY 1
+		adb forward "tcp:$FWD_PORT" "tcp:$DEV_PORT"
+		state_set ADB_FORWARD "$FWD_PORT"
+		"$host" host -device "127.0.0.1:$FWD_PORT" -vnc "127.0.0.1:$VNC_PORT" &
+		state_set PID_RELAY $!
+		log "relay ativo (Android < 5: túnel via adb forward)"
+	fi
+
+	if [[ "$LAUNCH_CLIENT" == 1 ]]; then
+		sleep 2
+		adbs am start -a android.intent.action.VIEW -d "vnc://127.0.0.1:$VNC_PORT" >/dev/null \
+			|| warn "nenhum app respondeu a vnc:// — abra o cliente manualmente"
+	fi
+}
+
+adb_kill_relay() {
+	# toolbox do Android 4.x não tem pkill/awk.
+	# shellcheck disable=SC2016 # expandido no tablet
+	adb shell 'ps | while read u p r; do case "$r" in *iconia-relay*) kill $p;; esac; done' \
+		>/dev/null 2>&1 || true
+}
+
+adb_remove() {
+	command -v adb >/dev/null || return 0
+	[[ -n "${ADB_REVERSE:-}" ]] && adb reverse --remove "tcp:$ADB_REVERSE" 2>/dev/null || true
+	[[ -n "${ADB_FORWARD:-}" ]] && adb forward --remove "tcp:$ADB_FORWARD" 2>/dev/null || true
+	[[ -n "${ADB_RELAY:-}" ]] && adb_kill_relay
+	[[ -n "${ADB_STAYON:-}" ]] && adb shell svc power stayon false >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------- ciclo
+cleanup() {
+	trap - EXIT INT TERM
+	state_load
+	local p pids=() i
+	for p in "${PID_RELAY:-}" "${PID_ADBSHELL:-}" "${PID_VNC:-}"; do
+		[[ -n "$p" ]] && kill "$p" 2>/dev/null && pids+=("$p")
+	done
+	# Espera até 3 s e força; o monitor só some depois que o VNC saiu.
+	for p in "${pids[@]}"; do
+		for ((i = 0; i < 30; i++)); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
+		kill -9 "$p" 2>/dev/null || true
+	done
+	adb_remove
+	case "${SESSION:-}" in
+		x11) x11_remove ;;
+		sway) sway_remove ;;
+	esac
+	rm -f "$STATE_FILE"
+	log "encerrado"
+}
+
+cmd_start() {
+	while (($#)); do
+		case "$1" in
+			--usb) MODE=usb ;;
+			--wifi) MODE=wifi ;;
+			--res) RES="$2"; shift ;;
+			--pos) POS="$2"; shift ;;
+			--method) METHOD="$2"; shift ;;
+			--port) VNC_PORT="$2"; shift ;;
+			--launch) LAUNCH_CLIENT=1 ;;
+			--insecure) INSECURE=1 ;;
+			-h|--help) usage; exit 0 ;;
+			*) die "opção desconhecida: $1" ;;
+		esac
+		shift
+	done
+	[[ "$POS" =~ ^(right|left|above|below)$ ]] || die "--pos inválido: $POS"
+	parse_res
+	[[ -f "$STATE_FILE" ]] && die "sessão anterior não encerrada; rode 'iconia stop'"
+
+	SESSION="$(session_type)"
+	mkdir -p "$STATE_DIR"; : >"$STATE_FILE"
+	state_set SESSION "$SESSION"
+	trap cleanup EXIT
+	trap 'exit 130' INT TERM
+
+	case "$SESSION" in
+		x11) x11_start ;;
+		sway) sway_start ;;
+		kde) kde_start ;;
+		gnome) die "GNOME Wayland não expõe monitor virtual via VNC. Entre na sessão 'GNOME on Xorg'." ;;
+		*) die "sessão gráfica não suportada ($SESSION)" ;;
+	esac
+
+	if [[ "$MODE" == usb ]]; then
+		adb_start
+		log "no tablet, conecte o cliente VNC em 127.0.0.1:$VNC_PORT"
+	else
+		log "no tablet, conecte o cliente VNC em um destes IPs, porta $VNC_PORT:"
+		hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | sed 's/^/    /' >&2 || true
+	fi
+	log "Ctrl+C para encerrar"
+	wait -n || true
+	warn "um dos processos terminou; encerrando"
+}
+
+cmd_stop() {
+	[[ -f "$STATE_FILE" ]] || { log "nada a desfazer"; return; }
+	cleanup
+}
+
+cmd_passwd() {
+	need x11vnc
+	mkdir -p "$(dirname "$PASS_FILE")"
+	x11vnc -storepasswd "$PASS_FILE"
+	chmod 600 "$PASS_FILE"
+}
+
+cmd_doctor() {
+	local s c
+	s="$(session_type)"
+	echo "sessão gráfica: $s"
+	for c in xrandr x11vnc cvt adb go swaymsg wayvnc jq krfb-virtualmonitor; do
+		printf '  %-22s %s\n' "$c" "$(command -v "$c" || echo '-')"
+	done
+	if [[ "$s" == x11 ]] && command -v xrandr >/dev/null; then
+		echo "saídas X11:"; xrandr | grep -E 'connected' | sed 's/^/  /'
+		echo "saída livre para o método output: $(x11_free_output || true)"
+	fi
+	if command -v adb >/dev/null; then
+		echo "adb:"; adb devices -l | sed 's/^/  /'
+		if adb get-state >/dev/null 2>&1; then
+			echo "  modelo: $(adbs getprop ro.product.model)  Android $(adbs getprop ro.build.version.release) (API $(adbs getprop ro.build.version.sdk))  ABI $(adbs getprop ro.product.cpu.abi)"
+			echo "  tela: $(adbs wm size 2>/dev/null || adbs dumpsys window | grep -m1 -oE 'init=[0-9]+x[0-9]+')"
+		fi
+	fi
+}
+
+case "${1:-}" in
+	start) shift; cmd_start "$@" ;;
+	stop) cmd_stop ;;
+	doctor) cmd_doctor ;;
+	passwd) cmd_passwd ;;
+	-h|--help|help|"") usage ;;
+	*) usage; exit 2 ;;
+esac
