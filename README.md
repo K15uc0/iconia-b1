@@ -4,6 +4,23 @@ Usa um tablet Android antigo (Acer Iconia B1 e similares, Android 4.1+) como **m
 
 Não exige root no tablet nem driver de vídeo especial no PC.
 
+## Guia rápido: Iconia B1-A71 + Ubuntu
+
+O B1-A71 tem tela 1024x600, Android 4.1 (API 16) e CPU ARMv7: são os padrões do projeto, nada a configurar.
+
+1. **Sessão Xorg no PC.** Na tela de login, clique no seu usuário, depois na engrenagem (canto inferior direito) e escolha **Ubuntu on Xorg**. Confira com `echo $XDG_SESSION_TYPE` → `x11`. Ubuntu 25.10 ou mais novo não tem essa opção: veja [Ubuntu 25.10+](#ubuntu-2510).
+2. **Instalar no PC:**
+
+   ```bash
+   git clone https://github.com/K15uc0/iconia-b1 && cd iconia-b1 && ./scripts/install-ubuntu.sh
+   ```
+
+   Instala `x11vnc`, `adb`, as regras udev (o adb enxerga o tablet sem sudo) e compila o relay. Se o Go do apt for antigo (22.04), o relay é baixado pronto da [release](https://github.com/K15uc0/iconia-b1/releases/latest).
+3. **Preparar o tablet:** ativar a Depuração USB e instalar um cliente VNC (seção [Tablet](#tablet)). O Android 4.1 não pede confirmação de chave RSA.
+4. **Usar:** cabo USB ligado, rode `iconia doctor` (deve mostrar `B1-A71 … API 16 … armeabi-v7a`), depois `iconia start`, e no cliente VNC conecte em `127.0.0.1:5900`.
+
+Para posicionar a tela do tablet à esquerda: `iconia start --pos left`.
+
 ## Como funciona
 
 ```
@@ -33,7 +50,7 @@ O script mantém a tela do tablet ligada enquanto estiver no USB (`svc power sta
 | X11 (qualquer DE) | saída livre via `xrandr --addmode`, ou framebuffer estendido + `--setmonitor` | `x11vnc` | testado (driver dummy do Xorg) |
 | Sway | `swaymsg create_output` | `wayvnc` | implementado, não testado |
 | KDE Plasma Wayland | `krfb-virtualmonitor` | embutido | implementado, não testado |
-| GNOME Wayland | — | — | não suportado: use a sessão "GNOME on Xorg" |
+| GNOME Wayland | — | — | não suportado: use a sessão "Ubuntu on Xorg" (até 25.04) |
 
 Tablets: o relay é compilado para `arm`, `arm64`, `386` e `amd64` e escolhido pelo ABI do aparelho (o Iconia One B1‑750, por exemplo, é x86).
 
@@ -43,10 +60,10 @@ Windows e macOS não estão cobertos por este projeto.
 
 ### PC
 
-Debian/Ubuntu (X11):
+Ubuntu: `./scripts/install-ubuntu.sh` (veja o guia rápido). Debian ou manual:
 
 ```bash
-sudo apt install x11vnc x11-xserver-utils adb
+sudo apt install x11vnc x11-xserver-utils adb android-sdk-platform-tools-common
 ```
 
 Arch: `x11vnc xorg-xrandr android-tools`. Fedora: `x11vnc xrandr android-tools`. Sway: `wayvnc jq`. KDE: `krfb`.
@@ -107,6 +124,19 @@ LAUNCH_CLIENT=1
 
 Se o seu não estiver na tabela, `iconia doctor` mostra a resolução real.
 
+## Ubuntu 25.10+
+
+O Ubuntu 25.10 removeu a sessão GNOME em Xorg (o GNOME agora é só Wayland), e este projeto depende de X11 no GNOME. Opções:
+
+- **Instalar uma sessão X11 leve** e usá-la quando quiser o segundo monitor:
+
+  ```bash
+  sudo apt install xubuntu-desktop-minimal
+  ```
+
+  No login, escolha **Xfce Session**; o `iconia start` funciona igual.
+- **GNOME Remote Desktop no modo "extend"** (`gsettings set org.gnome.desktop.remote-desktop.rdp screen-share-mode extend`) cria um monitor virtual via RDP, mas exige um cliente RDP com *Graphics Pipeline*; não verifiquei se existe algum assim que rode em Android 4.1.
+
 ## Ajustes no cliente VNC
 
 - Codificação **Tight** ou **ZRLE**; cor de 16 ou 24 bits.
@@ -137,3 +167,4 @@ Estrutura:
 
 - `bin/iconia`: orquestração (monitor virtual, VNC, adb, limpeza).
 - `relay/`: túnel reverso sobre `adb forward` para Android < 5.
+- `scripts/install-ubuntu.sh`: dependências e instalação no Ubuntu.

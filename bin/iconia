@@ -83,6 +83,17 @@ session_type() {
 	fi
 }
 
+gnome_hint() {
+	local id="" ver=""
+	# shellcheck source=/dev/null
+	[[ -r /etc/os-release ]] && { id="$(. /etc/os-release; echo "${ID:-}")"; ver="$(. /etc/os-release; echo "${VERSION_ID:-}")"; }
+	if [[ "$id" == ubuntu ]] && [[ "$(printf '%s\n' "$ver" 25.10 | sort -V | head -n1)" == 25.10 ]]; then
+		echo "Ubuntu $ver não tem mais sessão GNOME em Xorg. Instale outra sessão X11 (ex.: sudo apt install xubuntu-desktop-minimal) e escolha-a no login."
+	else
+		echo "GNOME Wayland não expõe monitor virtual via VNC. Saia e, na tela de login, escolha 'Ubuntu on Xorg' (engrenagem no canto inferior direito)."
+	fi
+}
+
 # ---------------------------------------------------------------- X11
 x11_primary() {
 	local p
@@ -241,11 +252,19 @@ kde_start() {
 }
 
 # ---------------------------------------------------------------- USB / adb
+RELEASE_URL="https://github.com/K15uc0/iconia-b1/releases/latest/download"
+
 relay_bin() {
 	local f="$ROOT/build/iconia-relay-$1"
+	if [[ ! -x "$f" ]] && command -v go >/dev/null; then
+		make -C "$ROOT" relay >&2 || warn "falha ao compilar o relay; tentando baixar"
+	fi
 	if [[ ! -x "$f" ]]; then
-		need go "Baixe os binários da release ou instale Go e rode 'make'."
-		make -C "$ROOT" relay >&2
+		need curl "Instale curl ou Go 1.22+."
+		log "baixando iconia-relay-$1 da última release"
+		mkdir -p "$ROOT/build"
+		curl -fsSL -o "$f.tmp" "$RELEASE_URL/iconia-relay-$1" || die "download falhou"
+		chmod 755 "$f.tmp"; mv "$f.tmp" "$f"
 	fi
 	echo "$f"
 }
@@ -363,7 +382,7 @@ cmd_start() {
 		x11) x11_start ;;
 		sway) sway_start ;;
 		kde) kde_start ;;
-		gnome) die "GNOME Wayland não expõe monitor virtual via VNC. Entre na sessão 'GNOME on Xorg'." ;;
+		gnome) die "$(gnome_hint)" ;;
 		*) die "sessão gráfica não suportada ($SESSION)" ;;
 	esac
 

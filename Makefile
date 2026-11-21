@@ -29,7 +29,7 @@ test:
 	cd relay && go vet ./... && go test -race -count=1 ./...
 
 lint:
-	shellcheck bin/iconia
+	shellcheck bin/iconia scripts/*.sh
 
 install:
 	mkdir -p $(PREFIX)/bin
